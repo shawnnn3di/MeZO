@@ -102,6 +102,16 @@ class OurArguments(TrainingArguments):
 
     # Auto saving when interrupted
     save_on_interrupt: bool = False # save model when interrupted (useful for long training)
+    
+    # ismezo
+    scope: int = -1
+    sample_scheme: str = 'default'
+    log_file: bool = True
+    # seedprune: float = 0.2
+    # refresh: float = 0.5
+    # anderson_k: int = 0
+    mu: float = 0.9
+    window_width: int = 10
 
 
 def parse_args():

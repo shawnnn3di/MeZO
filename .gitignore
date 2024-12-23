@@ -159,3 +159,5 @@ llm_eval/data
 *.ipynb
 *.output
 *.pdf
+history
+obsolete

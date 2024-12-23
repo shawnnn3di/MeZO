@@ -68,6 +68,7 @@ python run.py \
     --learning_rate $LR --num_train_epochs $EPOCH --per_device_train_batch_size $BS \
     --load_best_model_at_end --evaluation_strategy epoch --save_strategy epoch --save_total_limit 1 \
     --train_as_classification \
+    # --load_float16 \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@"

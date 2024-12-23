@@ -11,6 +11,10 @@ DEV=${DEV:-500}
 EVAL=${EVAL:-1000}
 STEPS=${STEPS:-20000}
 EVAL_STEPS=${EVAL_STEPS:-4000}
+SCOPE=${SCOPE:-1}
+SAMPLE_SCHEME=${SAMPLE_SCHEME:-default}
+ANDERSON_K=${ANDERSON_K:-0}
+
 
 MODE=${MODE:-ft}
 EXTRA_ARGS=""
@@ -19,7 +23,7 @@ if [ "$MODE" == "prefix" ]; then
 elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
-TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED
+
 
 TASK_ARGS=""
 case $TASK in
@@ -42,6 +46,8 @@ case $TASK in
         ;;
 esac
 
+TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$SCOPE-$SAMPLE_SCHEME-$ANDERSON_K
+
 echo $TAG
 echo "BS: $BS"
 echo "LR: $LR"
@@ -61,6 +67,9 @@ python run.py \
     --load_best_model_at_end --evaluation_strategy steps --save_strategy steps --save_total_limit 1 \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \
     --train_as_classification \
+    --scope $SCOPE \
+    --sample_scheme $SAMPLE_SCHEME \
+    --anderson $ANDERSON_K \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@"
