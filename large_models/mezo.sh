@@ -2,18 +2,22 @@ MODEL=${MODEL:-facebook/opt-1.3b}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
-BS=${BS:-16}
+BS=${BS:-8}
 LR=${LR:-1e-5}
 EPS=${EPS:-1e-3}
 SEED=${SEED:-0}
 TRAIN=${TRAIN:-1000}
 DEV=${DEV:-500}
 EVAL=${EVAL:-1000}
-STEPS=${STEPS:-20000}
-EVAL_STEPS=${EVAL_STEPS:-4000}
+STEPS=${STEPS:-10000}
+EVAL_STEPS=${EVAL_STEPS:-1000}
 SCOPE=${SCOPE:-1}
 SAMPLE_SCHEME=${SAMPLE_SCHEME:-default}
-ANDERSON_K=${ANDERSON_K:-0}
+WINDOW_WIDTH=${WINDOW_WIDTH:-0}
+MU=${MU:-0.9}
+ZOO_NAME=${ZOO_NAME:-default}
+NESTEROV=${NESTEROV:-False}
+STOP_MOMENTUM=${STOP_MOMENTUM:-5000}
 
 
 MODE=${MODE:-ft}
@@ -24,6 +28,10 @@ elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
 
+NESTEROV_ARGS=""
+if [ "$NESTEROV" == "True" ]; then 
+    NESTEROV_ARGS="--nesterov True"
+fi
 
 TASK_ARGS=""
 case $TASK in
@@ -46,7 +54,7 @@ case $TASK in
         ;;
 esac
 
-TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$SCOPE-$SAMPLE_SCHEME-$ANDERSON_K
+TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$SCOPE-$SAMPLE_SCHEME-mu$MU-ww$WINDOW_WIDTH-sm$STOP_MOMENTUM-zoo_$ZOO_NAME
 
 echo $TAG
 echo "BS: $BS"
@@ -69,7 +77,11 @@ python run.py \
     --train_as_classification \
     --scope $SCOPE \
     --sample_scheme $SAMPLE_SCHEME \
-    --anderson $ANDERSON_K \
+    --window_width $WINDOW_WIDTH \
+    --mu $MU \
+    --zoo_name $ZOO_NAME \
+    --stop_momentum $STOP_MOMENTUM \
     $EXTRA_ARGS \
     $TASK_ARGS \
+    $NESTEROV_ARGS \
     "$@"

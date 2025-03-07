@@ -214,6 +214,221 @@ SCALER_NAME = "scaler.pt"
 class OurTrainer(Trainer):
 
     from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
+    
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
+        if self.control.should_log:
+            if is_torch_tpu_available():
+                xm.mark_step()
+
+            logs: Dict[str, float] = {}
+
+            # all_gather + mean() to get average loss over all processes
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+
+            # reset tr_loss to zero
+            tr_loss -= tr_loss
+
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            logs["learning_rate"] = self._get_learning_rate()
+
+            self._total_loss_scalar += tr_loss_scalar
+            self._globalstep_last_logged = self.state.global_step
+            self.store_flos()
+
+            self.log(logs)
+
+        metrics = None
+        if self.control.should_evaluate:
+            if isinstance(self.eval_dataset, dict):
+                metrics = {}
+                for eval_dataset_name, eval_dataset in self.eval_dataset.items():
+                    dataset_metrics = self.evaluate(
+                        eval_dataset=eval_dataset,
+                        ignore_keys=ignore_keys_for_eval,
+                        metric_key_prefix=f"eval_{eval_dataset_name}",
+                    )
+                    metrics.update(dataset_metrics)
+            # else:
+            #     metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            #     logger.info(metrics)
+            self._report_to_hp_search(trial, self.state.global_step, metrics)
+
+        if self.control.should_save:
+            self._save_checkpoint(model, trial, metrics=metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            
+            
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        """
+        Setup the optimizer and the learning rate scheduler.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method (or `create_optimizer` and/or
+        `create_scheduler`) in a subclass.
+        """
+        self.create_optimizer()
+        if IS_SAGEMAKER_MP_POST_1_10 and smp.state.cfg.fp16:
+            # If smp >= 1.10 and fp16 is enabled, we unwrap the optimizer
+            optimizer = self.optimizer.optimizer
+        else:
+            optimizer = self.optimizer
+        self.create_scheduler(num_training_steps=num_training_steps, optimizer=optimizer)
+
+    def create_optimizer(self):
+        """
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+
+        if self.optimizer is None:
+            decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [
+                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+            optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+
+            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+                self.optimizer = OSS(
+                    params=optimizer_grouped_parameters,
+                    optim=optimizer_cls,
+                    **optimizer_kwargs,
+                )
+            else:
+                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+                if optimizer_cls.__name__ == "Adam8bit":
+                    import bitsandbytes
+
+                    manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                    skipped = 0
+                    for module in opt_model.modules():
+                        if isinstance(module, nn.Embedding):
+                            skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                            print(f"skipped {module}: {skipped/2**20}M params")
+                            manager.register_module_override(module, "weight", {"optim_bits": 32})
+                            logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                    print(f"skipped: {skipped/2**20}M params")
+
+        if is_sagemaker_mp_enabled():
+            self.optimizer = smp.DistributedOptimizer(self.optimizer)
+            
+        print(self.optimizer)
+
+        return self.optimizer
+            
+            
+    @staticmethod
+    def get_optimizer_cls_and_kwargs(args: TrainingArguments) -> Tuple[Any, Any]:
+        """
+        Returns the optimizer class and optimizer parameters based on the training arguments.
+
+        Args:
+            args (`transformers.training_args.TrainingArguments`):
+                The training arguments for the training session.
+
+        """
+
+        # parse args.optim_args
+        optim_args = {}
+        if args.optim_args:
+            for mapping in args.optim_args.replace(" ", "").split(","):
+                key, value = mapping.split("=")
+                optim_args[key] = value
+
+        optimizer_kwargs = {"lr": args.learning_rate}
+
+        adam_kwargs = {
+            "betas": (args.adam_beta1, args.adam_beta2),
+            "eps": args.adam_epsilon,
+        }
+        mSGD_kwargs = {
+            "momentum": args.momentum
+        }
+        
+        if args.optim == OptimizerNames.ADAFACTOR:
+            optimizer_cls = Adafactor
+            optimizer_kwargs.update({"scale_parameter": False, "relative_step": False})
+        elif args.optim == OptimizerNames.ADAMW_HF:
+            from .optimization import AdamW
+
+            optimizer_cls = AdamW
+            optimizer_kwargs.update(adam_kwargs)
+        elif args.optim in [OptimizerNames.ADAMW_TORCH, OptimizerNames.ADAMW_TORCH_FUSED]:
+            from torch.optim import AdamW
+
+            optimizer_cls = AdamW
+            optimizer_kwargs.update(adam_kwargs)
+            if args.optim == OptimizerNames.ADAMW_TORCH_FUSED:
+                optimizer_kwargs.update({"fused": True})
+        elif args.optim == OptimizerNames.ADAMW_TORCH_XLA:
+            try:
+                from torch_xla.amp.syncfree import AdamW
+
+                optimizer_cls = AdamW
+                optimizer_kwargs.update(adam_kwargs)
+            except ImportError:
+                raise ValueError("Trainer failed to import syncfree AdamW from torch_xla.")
+        elif args.optim == OptimizerNames.ADAMW_APEX_FUSED:
+            try:
+                from apex.optimizers import FusedAdam
+
+                optimizer_cls = FusedAdam
+                optimizer_kwargs.update(adam_kwargs)
+            except ImportError:
+                raise ValueError("Trainer tried to instantiate apex FusedAdam but apex is not installed!")
+        elif args.optim == OptimizerNames.ADAMW_BNB:
+            try:
+                from bitsandbytes.optim import Adam8bit
+
+                optimizer_cls = Adam8bit
+                optimizer_kwargs.update(adam_kwargs)
+            except ImportError:
+                raise ValueError("Trainer tried to instantiate bnb Adam8bit but bnb is not installed!")
+        elif args.optim == OptimizerNames.ADAMW_ANYPRECISION:
+            try:
+                from torchdistx.optimizers import AnyPrecisionAdamW
+
+                optimizer_cls = AnyPrecisionAdamW
+                optimizer_kwargs.update(adam_kwargs)
+
+                # TODO Change dtypes back to M=FP32, Var = BF16, Kahan = False once they can be cast together in torchdistx.
+                optimizer_kwargs.update(
+                    {
+                        "use_kahan_summation": strtobool(optim_args.get("use_kahan_summation", "False")),
+                        "momentum_dtype": getattr(torch, optim_args.get("momentum_dtype", "float32")),
+                        "variance_dtype": getattr(torch, optim_args.get("variance_dtype", "float32")),
+                        "compensation_buffer_dtype": getattr(
+                            torch, optim_args.get("compensation_buffer_dtype", "bfloat16")
+                        ),
+                    }
+                )
+            except ImportError:
+                raise ValueError("Please install https://github.com/pytorch/torchdistx")
+        elif args.optim == OptimizerNames.SGD:
+            optimizer_kwargs.update(mSGD_kwargs)
+            optimizer_cls = torch.optim.SGD
+        elif args.optim == OptimizerNames.ADAGRAD:
+            optimizer_cls = torch.optim.Adagrad
+        else:
+            raise ValueError(f"Trainer cannot instantiate unsupported optimizer: {args.optim}")
+        return optimizer_cls, optimizer_kwargs
+
+            
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -226,11 +441,16 @@ class OurTrainer(Trainer):
         # Data loader and number of training steps
         train_dataloader = self.get_train_dataloader()
         
+        
         # 创建一个文件处理器，设置日志文件路径
         file_handler = py_logging.FileHandler(os.path.join(self.args.output_dir, 'log'))
         file_handler.setLevel(py_logging.INFO)
         # 将处理器添加到 logger
         logger.addHandler(file_handler)
+        
+        self.g = torch.Generator(device='cuda')
+        
+        self.update_once = False if args.zoo_name in ['mSGD_3', 'mSGD_2', 'mSGD_1', 'adam', 'anderson'] else True
 
         # MeZO added: Linear probing
         if self.args.linear_probing:
@@ -371,6 +591,15 @@ class OurTrainer(Trainer):
             self.lr_scheduler = lr_scheduler
         elif not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+            
+        self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, 0.9998)
+        if args.zoo_name == 'mSGD_2':
+            # self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, [5000, 10000, 15000], gamma=0.31622776601683793319988935444327)
+            self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, 0.9998)
+            # pass
+        if args.zoo_name == 'anderson':
+            self.alpha_buffer = np.zeros((args.window_width, args.window_width + 1))
+            self.proj_buffer = np.zeros((args.window_width, args.window_width + 1))
 
         self.state = TrainerState()
         self.state.is_hyper_param_search = trial is not None
@@ -488,6 +717,7 @@ class OurTrainer(Trainer):
                     _ = list(train_dataloader.sampler)
 
         self.total_step = 0
+        timer = 0
         random_seed = None
         # if args.seedprune > 0:
         #     assert args.seedprune < 1, 'prune prob should be in [0, 1)'
@@ -495,15 +725,30 @@ class OurTrainer(Trainer):
         #     self.sampled = np.array([])
         #     self.accumulated_projection = np.array([])
         # elif args.scope > 0:
+        
+        self.history_loss = []
+        self.lowest = 9
+        self.counter = 0
+        
+        if args.zoo_name == 'adam':
+            self.adam = True
+        else:
+            self.adam = False
+            
         if args.scope > 0:
             print('SCOPE: %d' % args.scope)
             self.weight = np.array([1 / args.scope] * args.scope)
             self.sampled = np.array([0] * args.scope)
             self.accumulated_projection = np.array([0.0] * args.scope)
-        if args.anderson_k > 0:
+        if args.window_width > 0:
             self.history_projection = []
             self.history_seed = []
             
+        if self.adam:
+            self.anderson_beta1 = np.array([(args.beta1) ** (args.window_width-i) for i in range(args.window_width)])
+            self.anderson_beta2 = np.array([(args.beta2) ** (args.window_width-i) for i in range(args.window_width)])
+        
+        print(self.optimizer)
         
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
@@ -532,8 +777,13 @@ class OurTrainer(Trainer):
                 self._load_rng_state(resume_from_checkpoint)
 
             step = -1
+            metrics = self.evaluate(ignore_keys=ignore_keys_for_eval)
+            metrics['relative_time'] = timer
+            logger.info(metrics)
+            
             for step, inputs in enumerate(epoch_iterator):
-
+                
+                start = time.time()
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -594,68 +844,66 @@ class OurTrainer(Trainer):
                     tr_loss += tr_loss_step
 
                 self.current_flos += float(self.floating_point_ops(inputs))
-                
+                self.history_loss.append(tr_loss_step.detach().cpu().numpy())
                 
                 # ismezo, update weight
                 # todo
                 # kseedpro
                 self.total_step += 1
                 
-                if args.sample_scheme == 'kseedpro':
-                    print('kseedpro')
-                    self.sampled[random_seed] += 1
-                    self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
-                    self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
-                    self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
-                    self.weight[self.sampled == 0] = self.explored_projection_mean
-                    self.weight /= np.sum(self.weight)
-                    
-                    self.weight *= np.sum(self.accumulated_projection) / self.total_step
-                    self.weight = np.exp(self.weight)
-                    self.weight /= np.sum(self.weight)
-                if args.sample_scheme == 'is':
-                    print('is')
-                    self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
-                    self.projected_grad *= 1 / args.scope / self.weight[random_seed][0]
-                    
-                    # self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
-                    self.sampled[random_seed] += 1
-                    self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
-                    self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
-                    self.weight[self.sampled == 0] = self.explored_projection_mean
-                    self.weight += 1e-8
-                    self.weight /= np.sum(self.weight)
-                if args.sample_scheme == 'is_v1':
-                    print('is_v1')
-                    self.accumulated_projection[random_seed] = 0.8 * self.accumulated_projection[random_seed] + 0.2 * np.abs(self.projected_grad)
-                    self.projected_grad *= 1 / args.scope / self.weight[random_seed][0]
-                    
-                    # self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
-                    self.sampled[random_seed] += 1
-                    self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
-                    self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
-                    self.weight[self.sampled == 0] = self.explored_projection_mean
-                    self.weight += 1e-8
-                    self.weight /= np.sum(self.weight)
-                # if (args.seedprune > 0) & (args.sample_scheme == 'seedprune'):
-                #     print('seedprune')
-                #     if explore_flag:
-                #         self.explored = np.append(self.explored, random_seed).astype(np.int64)
-                #         self.accumulated_projection = np.append(self.accumulated_projection, np.abs(self.projected_grad))
-                #         self.weight = self.accumulated_projection + 1e-8
-                #         self.weight /= np.sum(self.weight)
-                    # else:
-                        # self.accumulated_projection[random_seed] = args.refresh * np.abs(self.projected_grad) + (1 - args.refresh) * self.accumulated_projection[random_seed]
-                        # self.projected_grad *= 1 / len(self.weight) / self.weight[random_seed][0]
-                        # self.weight += 1e-8
-                        # self.weight /= np.sum(self.weight)
-                if args.anderson_k > 0:
-                    self.history_projection.append(np.abs(self.projected_grad))
-                    self.history_seed.append(self.zo_random_seed)
-                    
-                
-                
-                logger.info('mylog, %d, %.4f, %.4f' % (self.total_step, tr_loss_step, tr_loss))
+                if args.trainer == 'zo':
+                    if args.sample_scheme == 'kseedpro':
+                        print('kseedpro')
+                        self.sampled[random_seed] += 1
+                        self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
+                        self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
+                        self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
+                        self.weight[self.sampled == 0] = self.explored_projection_mean
+                        self.weight /= np.sum(self.weight)
+                        
+                        self.weight *= np.sum(self.accumulated_projection) / self.total_step
+                        self.weight = np.exp(self.weight)
+                        self.weight /= np.sum(self.weight)
+                    if args.sample_scheme == 'is':
+                        print('is')
+                        self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
+                        self.projected_grad *= 1 / args.scope / self.weight[random_seed][0]
+                        
+                        # self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
+                        self.sampled[random_seed] += 1
+                        self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
+                        self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
+                        self.weight[self.sampled == 0] = self.explored_projection_mean
+                        self.weight += 1e-8
+                        self.weight /= np.sum(self.weight)
+                    if args.sample_scheme == 'is_v1':
+                        print('is_v1')
+                        self.accumulated_projection[random_seed] = 0.8 * self.accumulated_projection[random_seed] + 0.2 * np.abs(self.projected_grad)
+                        self.projected_grad *= 1 / args.scope / self.weight[random_seed][0]
+                        
+                        # self.accumulated_projection[random_seed] += np.abs(self.projected_grad)
+                        self.sampled[random_seed] += 1
+                        self.explored_projection_mean = np.sum(self.accumulated_projection[self.sampled > 0]) / self.total_step
+                        self.weight[self.sampled > 0] = self.accumulated_projection[self.sampled > 0] / self.sampled[self.sampled > 0]
+                        self.weight[self.sampled == 0] = self.explored_projection_mean
+                        self.weight += 1e-8
+                        self.weight /= np.sum(self.weight)
+                    # if (args.seedprune > 0) & (args.sample_scheme == 'seedprune'):
+                    #     print('seedprune')
+                    #     if explore_flag:
+                    #         self.explored = np.append(self.explored, random_seed).astype(np.int64)
+                    #         self.accumulated_projection = np.append(self.accumulated_projection, np.abs(self.projected_grad))
+                    #         self.weight = self.accumulated_projection + 1e-8
+                    #         self.weight /= np.sum(self.weight)
+                        # else:
+                            # self.accumulated_projection[random_seed] = args.refresh * np.abs(self.projected_grad) + (1 - args.refresh) * self.accumulated_projection[random_seed]
+                            # self.projected_grad *= 1 / len(self.weight) / self.weight[random_seed][0]
+                            # self.weight += 1e-8
+                            # self.weight /= np.sum(self.weight)
+                    if args.window_width > 0:
+                        # self.history_projection.append(np.abs(self.projected_grad))
+                        self.history_projection.append(self.projected_grad)
+                        self.history_seed.append(self.zo_random_seed)
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                 if self.deepspeed:
@@ -727,9 +975,12 @@ class OurTrainer(Trainer):
                     self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
+                
+                timer += time.time() - start
+                logger.info('mylog, %d, %.4f, %.4f, %.4f, %d, %.4f' % (self.total_step, tr_loss_step, tr_loss, self.lowest, self.counter, timer))
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+                
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
@@ -795,7 +1046,6 @@ class OurTrainer(Trainer):
                     shutil.rmtree(checkpoint)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
 
@@ -812,10 +1062,12 @@ class OurTrainer(Trainer):
 
         # Set the random seed to ensure that we sample the same z for perturbation/update
         torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+        self.g.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
         
         for name, param in self.named_parameters_to_optim:
-            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype, generator=self.g)
             param.data = param.data + scaling_factor * z * self.args.zo_eps
+        # print(self.g.get_state())
 
 
     def zo_forward(self, model, inputs):
@@ -882,16 +1134,54 @@ class OurTrainer(Trainer):
         # Second function evaluation
         self.zo_perturb_parameters(scaling_factor=-2)
         loss2 = self.zo_forward(model, inputs)
+        
+        self.zo_perturb_parameters(scaling_factor=1)
+        loss0 = self.zo_forward(model, inputs)
+        
+        
+        df = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        pddf = ((loss2 - 2 * loss0 + loss1) / (self.args.zo_eps ** 2)).item() + 1e-8
+        if np.abs(pddf) < 1e-5:
+            pddf = 1e-5
+        ddf = np.clip(pddf, -1e5, 1e5)
 
-        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        # self.projected_grad = np.clip(df / ddf, -1e5, 1e-5)
+        self.projected_grad = df
+        
+        print('%.4f, %.4f, %.4f' % (df, ddf, self.projected_grad))
 
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
 
         # Reset model back to its parameters at start of step
-        self.zo_perturb_parameters(scaling_factor=1)
+        # self.zo_perturb_parameters(scaling_factor=1)
         
-        return loss1
+        return loss0
+        
+        # self.zo_perturb_parameters(scaling_factor=-2)
+        # loss_l2 = self.zo_forward(model, inputs)
+        # self.zo_perturb_parameters(scaling_factor=1)
+        # loss_l1 = self.zo_forward(model, inputs)
+        # self.zo_perturb_parameters(scaling_factor=2)
+        # loss_r1 = self.zo_forward(model, inputs)
+        # self.zo_perturb_parameters(scaling_factor=1)
+        # loss_r2 = self.zo_forward(model, inputs)
+        # self.zo_perturb_parameters(scaling_factor=-2)
+        # loss_c = self.zo_forward(model, inputs)
+        
+        # df = ((loss_l2 - 8 * loss_l1 + 8 * loss_r1 - loss_r2) / (self.args.zo_eps * 12)).item()
+        # ddf = float(np.clip( - ((loss_l2 - 16 * loss_l1 + 30 * loss_c - 16 * loss_r1 + loss_r2) / (self.args.zo_eps ** 2 * 12)).item(), -1e5, 1e5))
+        # ddf = np.clip(np.abs(ddf), 0.001, 1e5) ** 0.25 #* ((ddf > 0) - 0.5) * 2
+        # self.projected_grad = np.clip(df / ddf, -1e5, 1e5)
+        # # self.projected_grad = df 
+        
+        # print(np.clip( - ((loss_l2 - 16 * loss_l1 + 30 * loss_c - 16 * loss_r1 + loss_r2) / (self.args.zo_eps ** 2 * 12)).item(), -1e5, 1e5))
+        
+        # print('%.4f, %.4f, %.4f' % (df, ddf, self.projected_grad))
+        
+        # assert self.args.gradient_accumulation_steps == 1
+        
+        # return loss_c
 
 
     def zo_update(self, model):
@@ -899,10 +1189,255 @@ class OurTrainer(Trainer):
         Update the parameters with the estimated gradients.
         """
         args = self.args
+        k = args.window_width
+        m = min(k, len(self.history_seed))
+
+        # if self.total_step == args.stop_momentum:
+        #     self.update_once = True
+        if args.zoo_name in ['mSGD_1', 'mSGD_3', 'adam',  'mSGD_2', 'anderson']:
+            n = 200
+            if self.total_step > n:
+                self.record_loss = np.mean(np.array(self.history_loss[-n:]))
+                if self.record_loss < self.lowest:
+                    self.lowest = self.record_loss
+                    self.counter = 0
+                else:
+                    self.counter += 1
+                if self.counter > 40000:
+                    if self.update_once == False:
+                        logger.info('abandon momentum at step %d' % self.total_step)
+                    self.update_once = True
 
         # Reset the random seed for sampling zs
-        torch.manual_seed(self.zo_random_seed)
-        if args.anderson_k < 1:
+        
+        if not self.update_once:
+            if not args.zoo_name == 'anderson':
+                
+                # anderson_projection = np.clip(self.history_projection[-m:], 1e-8, 100000)
+                if args.zoo_name == 'mSGD_1':
+                    # self.anderson_weight = np.array([(args.mu * np.max([0, (args.mu - self.total_step / args.max_steps)])) ** (args.window_width-i-1) for i in range(args.window_width)])
+                    
+                    self.anderson_weight = np.abs(np.array(self.history_projection[-m:]))
+                    self.anderson_weight = self.anderson_weight / np.sum(self.anderson_weight) * m * np.array([args.mu ** (args.window_width-i-1) for i in range(args.window_width)])[-m:]
+                    anderson_projection = np.clip(self.history_projection[-m:], -1e8, 1e8)
+                    anderson_seed = self.history_seed[-m:]
+                    
+                elif args.zoo_name == 'mSGD_2':
+                    # anderson_projection = np.clip(self.history_projection[-m:], -1e5, 1e5)
+                    # anderson_seed = self.history_seed[-m:]
+                    # self.anderson_weight = 1 / np.clip(np.abs(anderson_projection), 1e-5, 1e5)
+                    # self.anderson_weight /= np.sum(self.anderson_weight)
+                    # sample_weight = np.abs(anderson_projection)
+                    # sample_weight /= np.sum(sample_weight)
+                    # idx = np.random.choice(m, m, p=sample_weight)
+                    # anderson_seed = np.array(anderson_seed)[idx]
+                    # self.anderson_weight = self.anderson_weight[idx]
+                    
+                    self.anderson_weight = 1 / np.array(self.history_loss[-m:])
+                    self.anderson_weight = self.anderson_weight / np.sum(self.anderson_weight) * m * np.array([args.mu ** (args.window_width-i-1) for i in range(args.window_width)])[-m:]
+                    anderson_projection = np.clip(self.history_projection[-m:], -1e8, 1e8)
+                    anderson_seed = self.history_seed[-m:]
+                    
+                elif args.zoo_name in ['mSGD_3', 'adam']:
+
+                    self.anderson_weight = np.array([args.mu ** (args.window_width-i-1) for i in range(args.window_width)])
+                    anderson_projection = np.clip(self.history_projection[-m:], -1e8, 1e8)
+                    anderson_seed = self.history_seed[-m:]
+                    
+                if not self.adam:
+                    for i in range(m):
+                        torch.manual_seed(anderson_seed[i])
+                        self.g.manual_seed(anderson_seed[i])
+                        for name, param in self.named_parameters_to_optim:
+                            # Resample z
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                            param.data = param.data - self._get_learning_rate() * anderson_projection[i] * self.anderson_weight[i] * z
+                            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                                param.data = param.data - self._get_learning_rate() * (args.weight_decay * param.data)
+                    if args.nesterov:
+                        torch.manual_seed(anderson_seed[-1])
+                        self.g.manual_seed(anderson_seed[-1])
+                        for name, param in self.named_parameters_to_optim:
+                            # Resample z
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                            param.data = param.data - self._get_learning_rate() * (anderson_projection[-1] * self.anderson_weight[-1] * z)
+                else:
+                    
+                    state_list = []
+                    for i in range(m):
+                        torch.manual_seed(anderson_seed[i])
+                        self.g.manual_seed(anderson_seed[i])
+                        state_list.append(self.g.get_state())
+                        
+                    for name, param in self.named_parameters_to_optim:
+                        for i in range(m):
+                            self.g.set_state(state_list[i])
+                            _m = torch.zeros(size=param.data.size(), device=param.data.device, dtype=param.data.dtype, requires_grad=False)
+                            _v = torch.zeros(size=param.data.size(), device=param.data.device, dtype=param.data.dtype, requires_grad=False)
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype, generator=self.g)
+                            state_list[i] = self.g.get_state()
+                            
+                            if i != m-1:
+                                if m != 1:
+                                    _m += self.anderson_beta1[-(m-1):][i] * (anderson_projection[i] * z)
+                                    _v += self.anderson_beta2[-(m-1):][i] * ((anderson_projection[i] * z) ** 2)
+                                else:
+                                    pass
+                            else:
+                                # _m += (1 - args.beta1) * z * anderson_projection[-1]
+                                # _v += (1 - args.beta2) * (z ** 2) * anderson_projection[-1]
+                                _m += (1 - args.beta1) * z * anderson_projection[-1]
+                                _v += (1 - args.beta2) * (z * anderson_projection[-1]) ** 2
+                                # _m = z * anderson_projection[-1]
+                                # _v = (z * anderson_projection[-1]) ** 2
+                            
+                            # _v = (1 - args.beta2) * (z * anderson_projection[-1] - _m) ** 2
+                            
+                            # _m /= (1 - args.beta1 ** self.total_step)
+                            # _v /= (1 - args.beta2 ** self.total_step)
+                            _v = torch.clip(_v, 0.000976562, 66503)
+                            # _v /= _v.mean()
+                            # print(_v.mean())
+                            
+                            # _m += z * anderson_projection[i]
+                            
+                            # param.data = param.data - self._get_learning_rate() * torch.clip(_m / (_v ** 0.5 + 1e-7), -1e4, 1e4)
+                            # param.data = param.data - torch.clip(self._get_learning_rate() / (torch.sqrt(_v)), 0.000976562, 66503) * _m
+                            
+                            # v1
+                            # grad = _m / (torch.sqrt(_v) * ((1 - args.beta1 ** self.total_step) / (1 - args.beta2 ** self.total_step)) + 1e-5)
+                            # v2
+                            grad = _m / (_v * ((1 - args.beta1 ** self.total_step) / (1 - args.beta2 ** self.total_step)) + 1e-5)
+                            
+                            # gradnorm = torch.mean(grad)
+                            # if gradnorm > 0.01:
+                            #     grad *= 0.01 / gradnorm
+                            param.data = param.data - self._get_learning_rate() * (grad / (torch.norm(grad) + 1e-5))
+                            # param.data = param.data - self._get_learning_rate() * torch.clip(_m / ((_v ** 0.5).max() + 1e-8), -1e10, 1e10)
+                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                        param.data = param.data - self._get_learning_rate() * (args.weight_decay * param.data)
+                        
+                    a = 1
+                
+            else:
+                torch.manual_seed(self.zo_random_seed)
+                self.g.manual_seed(self.zo_random_seed)
+                for name, param in self.named_parameters_to_optim:
+                    # Resample z
+                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype, generator=self.g)
+                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                        param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                    else:
+                        param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+                        
+                if self.total_step % args.window_width == 0:
+                    mix_weight = 1 / np.array(self.history_loss[-args.window_width:])
+                    mix_weight /= np.sum(mix_weight)
+                    for i in range(args.window_width):
+                        self.zo_random_seed = self.history_seed[-i]
+                        self.projected_grad = self.history_projection[-i]
+                        torch.manual_seed(self.zo_random_seed)
+                        self.g.manual_seed(self.zo_random_seed)
+                        for name, param in self.named_parameters_to_optim:
+                            # Resample z
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                                param.data = param.data + self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                            else:
+                                param.data = param.data + self._get_learning_rate() * (self.projected_grad * z)
+                    
+                    for i in range(args.window_width):
+                        self.zo_random_seed = self.history_seed[-i]
+                        self.projected_grad = self.history_projection[-i]
+                        w = (1 - np.sum(mix_weight[-i:]))
+                        torch.manual_seed(self.zo_random_seed)
+                        self.g.manual_seed(self.zo_random_seed)
+                        for name, param in self.named_parameters_to_optim:
+                            # Resample z
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                                param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data) * w
+                            else:
+                                param.data = param.data - self._get_learning_rate() * (self.projected_grad * z) * w
+                
+                
+                inner_step = self.total_step % args.window_width
+                if (inner_step - 1) == 0:
+                    self.alpha_buffer = np.zeros((args.window_width, args.window_width + 1))
+                    self.proj_buffer = np.zeros((args.window_width, args.window_width + 1))
+                    self.alpha_buffer[0][0] = 1
+                    self.alpha_buffer[0][1] = 1
+                    self.proj_buffer[0][0] = 1
+                    self.proj_buffer[0][1] = self.projected_grad
+                    
+                    torch.manual_seed(self.zo_random_seed)
+                    self.g.manual_seed(self.zo_ranmdom_seed)
+                    for name, param in self.named_parameters_to_optim:
+                        # Resample z
+                        z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                        if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                            param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                        else:
+                            param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+                else:
+                    if inner_step == 0:
+                        inner_step = args.window_width
+                    # mix_weight = np.tan(np.clip(self.history_loss[-inner_step:], 0, 3.1415926/2))
+                    mix_weight = np.array(self.history_loss[-inner_step:])
+                    mix_weight = 1 / mix_weight
+                    mix_weight /= np.sum(mix_weight)
+                    self.alpha_buffer[inner_step - 1][0] = 1
+                    self.proj_buffer[inner_step - 1][0] = 1
+                    self.alpha_buffer[inner_step - 1] = np.matmul(mix_weight, self.alpha_buffer[:inner_step])
+                    self.alpha_buffer[inner_step - 1][inner_step] = 1
+                    self.proj_buffer[inner_step - 1] = np.matmul(mix_weight, self.proj_buffer[:inner_step])
+                    self.proj_buffer[inner_step - 1][inner_step] = self.projected_grad
+                    
+                    for i in range(inner_step):
+                        torch.manual_seed(self.history_seed[-i])
+                        self.g.manual_seed(self.history_seed[-i])
+                        projected_grad = self.proj_buffer[inner_step - 1][-i] - self.proj_buffer[inner_step - 2][-i]
+                        for name, param in self.named_parameters_to_optim:
+                            # Resample z
+                            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                            if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                                param.data = param.data - self._get_learning_rate() * (projected_grad * z + args.weight_decay * param.data)
+                            else:
+                                param.data = param.data - self._get_learning_rate() * (projected_grad * z)
+                
+                
+                
+                # inner_step = self.total_step % args.window_width
+                # if (inner_step - 1) != 0:
+                
+                
+                # torch.manual_seed(self.zo_random_seed)
+                # for name, param in self.named_parameters_to_optim:
+                #     # Resample z
+                #     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                #     if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                #         param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
+                #     else:
+                #         param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+                        
+                # torch.manual_seed(torch.randint(100000000000000, (1, )))
+                # for name, param in self.named_parameters_to_optim:
+                #     # Resample z
+                #     z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype) * 0.03
+                #     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+                        
+
+            # else:
+            #     self.update_once = True
+            
+            # logger.info(f'{anderson_projection}')
+
+
+                            # print(name)
+                            # print(torch.isnan(param.data).sum())
+        else:
+            torch.manual_seed(self.zo_random_seed)
+            self.g.manual_seed(self.zo_random_seed)
             for name, param in self.named_parameters_to_optim:
                 # Resample z
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
@@ -910,25 +1445,6 @@ class OurTrainer(Trainer):
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
                 else:
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
-        else:
-            k = args.anderson_k
-            m = min(k, len(self.history_seed))
-            anderson_projection = np.clip(self.history_projection[-m:], 1e-5, 100000)
-            anderson_seed = self.history_seed[-m:]
-            anderson_weight = 1 / np.array(anderson_projection)
-            anderson_weight = (anderson_weight + 1e-5) / np.sum(anderson_weight + m * 1e-5)
-            # print(anderson_weight)
-            logger.info(f'{anderson_projection}')
-            for i in range(m):
-                torch.manual_seed(anderson_seed[i])
-                for name, param in self.named_parameters_to_optim:
-                    # Resample z
-                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                        param.data = param.data - self._get_learning_rate() * (anderson_projection[i] * anderson_weight[i] * z + args.weight_decay * param.data / m)
-                    else:
-                        param.data = param.data - self._get_learning_rate() * (anderson_projection[i] * anderson_weight[i] * z)
-            
 
         self.lr_scheduler.step()
 

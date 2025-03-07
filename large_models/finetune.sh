@@ -8,7 +8,7 @@ LR=${LR:-1e-5}
 SEED=${SEED:-0}
 TRAIN=${TRAIN:-1000}
 DEV=${DEV:-500}
-EVAL=${EVAL:-1000}
+EVAL=${EVAL:-100000}
 
 MODE=${MODE:-ft}
 EXTRA_ARGS=""
@@ -63,7 +63,7 @@ echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 python run.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir result/fo$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --trainer regular --fp16 \
     --learning_rate $LR --num_train_epochs $EPOCH --per_device_train_batch_size $BS \
     --load_best_model_at_end --evaluation_strategy epoch --save_strategy epoch --save_total_limit 1 \

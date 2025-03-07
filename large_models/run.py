@@ -110,8 +110,23 @@ class OurArguments(TrainingArguments):
     # seedprune: float = 0.2
     # refresh: float = 0.5
     # anderson_k: int = 0
-    mu: float = 0.9
+    zoo_name: str = 'default'
+    mu: float = 0.0
+    nesterov: bool = False
     window_width: int = 10
+    amsgrad: bool = False
+    beta1: float = 0.9
+    beta2: float = 0.999
+    
+    gradient_checkpointing: bool = False
+    
+    weight_decay: float = 1e-4
+    
+    stop_momentum: int = 5000
+    
+    optim: str = 'sgd'
+    momentum: float = 0.9
+
 
 
 def parse_args():
